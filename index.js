@@ -19,7 +19,7 @@ let inMemory = []
 async function getAllTodos() {
   if (mongoose.connection.readyState === 1) {
     const docs = await Todo.find({}).sort({ position: 1, createdAt: -1 }).lean()
-    return docs.map(d => ({ id: String(d._id), text: d.text, completed: d.completed, category: d.category, priority: d.priority, position: d.position, dueDate: d.dueDate || null, dueTime: d.dueTime || null }))
+    return docs.map(d => ({ id: String(d._id), text: d.text, completed: d.completed, category: d.category, priority: d.priority, position: d.position, dueDate: d.dueDate || null, dueTime: d.dueTime || null, dependencies: d.dependencies || [], locked: !!d.locked }))
   }
   return inMemory.slice().map(d => ({ ...d }))
 }
@@ -28,11 +28,40 @@ async function replaceAllTodos(todos) {
   if (mongoose.connection.readyState === 1) {
     // simple replace strategy: remove all and insert provided (not ideal for production)
     await Todo.deleteMany({})
-    const docs = await Todo.insertMany(todos.map((t, i) => ({ text: t.text, completed: !!t.completed, category: t.category || 'other', priority: t.priority || 'low', dueDate: t.dueDate || null, dueTime: t.dueTime || null, position: i })))
-    return docs.map(d => ({ id: String(d._id), text: d.text, completed: d.completed, category: d.category, priority: d.priority, position: d.position, dueDate: d.dueDate || null, dueTime: d.dueTime || null }))
+    const docs = await Todo.insertMany(todos.map((t, i) => ({ text: t.text, completed: !!t.completed, category: t.category || 'other', priority: t.priority || 'low', dueDate: t.dueDate || null, dueTime: t.dueTime || null, dependencies: t.dependencies || [], locked: !!t.locked, position: i })))
+    return docs.map(d => ({ id: String(d._id), text: d.text, completed: d.completed, category: d.category, priority: d.priority, position: d.position, dueDate: d.dueDate || null, dueTime: d.dueTime || null, dependencies: d.dependencies || [], locked: !!d.locked }))
   }
-  inMemory = todos.map((t, i) => ({ id: t.id || ('m_' + Date.now() + '_' + i), text: t.text, completed: !!t.completed, category: t.category || 'other', priority: t.priority || 'low', dueDate: t.dueDate || null, dueTime: t.dueTime || null, position: i }))
+  inMemory = todos.map((t, i) => ({ id: t.id || ('m_' + Date.now() + '_' + i), text: t.text, completed: !!t.completed, category: t.category || 'other', priority: t.priority || 'low', dueDate: t.dueDate || null, dueTime: t.dueTime || null, dependencies: t.dependencies || [], locked: !!t.locked, position: i }))
   return inMemory.slice()
+}
+
+// helpers for automation
+function computePriorityByDue(dueDate, dueTime) {
+  if (!dueDate) return null
+  try {
+    const target = new Date(dueDate + (dueTime ? ('T' + dueTime + ':00') : 'T00:00:00'))
+    const now = new Date()
+    const diff = target - now
+    const day = 24 * 60 * 60 * 1000
+    if (diff <= 0) return 'high'
+    if (diff <= day) return 'high'
+    if (diff <= 3 * day) return 'medium'
+    return null
+  } catch (e) { return null }
+}
+
+async function computeLockedFor(id, deps) {
+  if (!Array.isArray(deps) || deps.length === 0) return false
+  if (mongoose.connection.readyState === 1) {
+    const docs = await Todo.find({ _id: { $in: deps } }).lean()
+    const allDone = docs.every(d => d && d.completed)
+    return !allDone
+  }
+  // in-memory
+  return deps.some(dep => {
+    const t = inMemory.find(x => x.id === dep)
+    return !(t && t.completed)
+  })
 }
 
 // REST endpoints for optional usage
@@ -112,8 +141,13 @@ async function handleMessage(ws, msg) {
     if (mongoose.connection.readyState === 1) {
       const last = await Todo.findOne().sort({ position: -1 }).lean()
       const pos = last ? (last.position || 0) + 1 : 0
-      const doc = await Todo.create({ text: todo.text, completed: !!todo.completed, category: todo.category || 'other', priority: todo.priority || 'low', dueDate: todo.dueDate || null, dueTime: todo.dueTime || null, position: pos })
-      const real = { id: String(doc._id), text: doc.text, completed: doc.completed, category: doc.category, priority: doc.priority, position: doc.position, dueDate: doc.dueDate || null, dueTime: doc.dueTime || null }
+      // compute automated priority if due date suggests escalation
+      const auto = computePriorityByDue(todo.dueDate, todo.dueTime)
+      const priority = todo.priority || auto || 'low'
+      const deps = Array.isArray(todo.dependencies) ? todo.dependencies : []
+      const locked = await computeLockedFor(null, deps)
+      const doc = await Todo.create({ text: todo.text, completed: !!todo.completed, category: todo.category || 'other', priority, dueDate: todo.dueDate || null, dueTime: todo.dueTime || null, dependencies: deps, locked: locked, position: pos })
+      const real = { id: String(doc._id), text: doc.text, completed: doc.completed, category: doc.category, priority: doc.priority, position: doc.position, dueDate: doc.dueDate || null, dueTime: doc.dueTime || null, dependencies: doc.dependencies || [], locked: !!doc.locked }
       // confirm optimistic
       if (tempId) ws.send(JSON.stringify({ type: 'sync:confirm', payload: { tempId, realId: real.id } }))
       // broadcast new todo
@@ -121,7 +155,11 @@ async function handleMessage(ws, msg) {
     } else {
       // in-memory
       const id = 'm_' + Date.now()
-      const obj = { id, text: todo.text, completed: !!todo.completed, category: todo.category || 'other', priority: todo.priority || 'low', dueDate: todo.dueDate || null, dueTime: todo.dueTime || null, position: inMemory.length }
+      const auto = computePriorityByDue(todo.dueDate, todo.dueTime)
+      const priority = todo.priority || auto || 'low'
+      const deps = Array.isArray(todo.dependencies) ? todo.dependencies : []
+      const locked = await computeLockedFor(null, deps)
+      const obj = { id, text: todo.text, completed: !!todo.completed, category: todo.category || 'other', priority, dueDate: todo.dueDate || null, dueTime: todo.dueTime || null, dependencies: deps, locked: locked, position: inMemory.length }
       inMemory.unshift(obj)
       if (tempId) ws.send(JSON.stringify({ type: 'sync:confirm', payload: { tempId, realId: obj.id } }))
       broadcast({ type: 'sync:update', payload: { todo: obj } }, ws)
@@ -130,21 +168,42 @@ async function handleMessage(ws, msg) {
   }
 
   if (type === 'todo:edit') {
-    const { id, text, category, priority, dueDate, dueTime } = payload || {}
+    const { id, text, category, priority, dueDate, dueTime, dependencies } = payload || {}
     if (!id) return
     if (mongoose.connection.readyState === 1) {
-      await Todo.findByIdAndUpdate(id, { text, category, priority, dueDate: dueDate || null, dueTime: dueTime || null, updatedAt: Date.now() }).lean()
+      // if dependencies changed or due date changed, recompute locked/priority
+      const deps = Array.isArray(dependencies) ? dependencies : undefined
+      const update = { updatedAt: Date.now() }
+      if (text !== undefined) update.text = text
+      if (category !== undefined) update.category = category
+      if (dueDate !== undefined) update.dueDate = dueDate || null
+      if (dueTime !== undefined) update.dueTime = dueTime || null
+      // compute priority if not explicitly provided
+      const auto = computePriorityByDue(dueDate, dueTime)
+      update.priority = priority || auto || 'low'
+      if (deps !== undefined) update.dependencies = deps
+      await Todo.findByIdAndUpdate(id, update).lean()
       const doc = await Todo.findById(id).lean()
-      const t = { id: String(doc._id), text: doc.text, completed: doc.completed, category: doc.category, priority: doc.priority, position: doc.position, dueDate: doc.dueDate || null, dueTime: doc.dueTime || null }
+      // ensure locked reflects current dependency state
+      const locked = await computeLockedFor(id, doc.dependencies || [])
+      if (locked !== !!doc.locked) {
+        await Todo.findByIdAndUpdate(id, { locked })
+        doc.locked = locked
+      }
+      const t = { id: String(doc._id), text: doc.text, completed: doc.completed, category: doc.category, priority: doc.priority, position: doc.position, dueDate: doc.dueDate || null, dueTime: doc.dueTime || null, dependencies: doc.dependencies || [], locked: !!doc.locked }
       broadcast({ type: 'sync:update', payload: { todo: t } })
     } else {
       const idx = inMemory.findIndex(x => x.id === id)
       if (idx !== -1) {
-        inMemory[idx].text = text
-        inMemory[idx].category = category || inMemory[idx].category
-        inMemory[idx].priority = priority || inMemory[idx].priority
-        inMemory[idx].dueDate = dueDate || null
-        inMemory[idx].dueTime = dueTime || null
+        if (text !== undefined) inMemory[idx].text = text
+        if (category !== undefined) inMemory[idx].category = category || inMemory[idx].category
+        if (dueDate !== undefined) inMemory[idx].dueDate = dueDate || null
+        if (dueTime !== undefined) inMemory[idx].dueTime = dueTime || null
+        const auto = computePriorityByDue(dueDate, dueTime)
+        inMemory[idx].priority = priority || auto || inMemory[idx].priority || 'low'
+        if (Array.isArray(dependencies)) inMemory[idx].dependencies = dependencies
+        // recompute locked
+        inMemory[idx].locked = await computeLockedFor(id, inMemory[idx].dependencies || [])
         broadcast({ type: 'sync:update', payload: { todo: inMemory[idx] } })
       }
     }
@@ -172,12 +231,43 @@ async function handleMessage(ws, msg) {
       if (!doc) return
       doc.completed = !doc.completed
       await doc.save()
-      broadcast({ type: 'sync:update', payload: { todo: { id: String(doc._id), text: doc.text, completed: doc.completed, category: doc.category, priority: doc.priority, position: doc.position, dueDate: doc.dueDate || null, dueTime: doc.dueTime || null } } })
+      const updated = { id: String(doc._id), text: doc.text, completed: doc.completed, category: doc.category, priority: doc.priority, position: doc.position, dueDate: doc.dueDate || null, dueTime: doc.dueTime || null, dependencies: doc.dependencies || [], locked: !!doc.locked }
+      broadcast({ type: 'sync:update', payload: { todo: updated } })
+      // if completed, check dependents to possibly unlock them
+      if (doc.completed) {
+        const dependents = await Todo.find({ dependencies: String(doc._id) }).lean()
+        for (const dep of dependents) {
+          const locked = await computeLockedFor(dep._id, dep.dependencies || [])
+          if (!locked && dep.locked) {
+            await Todo.findByIdAndUpdate(dep._id, { locked: false })
+            const newDoc = await Todo.findById(dep._id).lean()
+            broadcast({ type: 'sync:update', payload: { todo: { id: String(newDoc._id), text: newDoc.text, completed: newDoc.completed, category: newDoc.category, priority: newDoc.priority, position: newDoc.position, dueDate: newDoc.dueDate || null, dueTime: newDoc.dueTime || null, dependencies: newDoc.dependencies || [], locked: false } } })
+            // send a gentle reminder notification to clients
+            broadcast({ type: 'todo:reminder', payload: { id: String(newDoc._id), message: 'A dependency finished — this task is unlocked.' } })
+          }
+        }
+      }
     } else {
       const idx = inMemory.findIndex(x => x.id === id)
       if (idx !== -1) {
         inMemory[idx].completed = !inMemory[idx].completed
         broadcast({ type: 'sync:update', payload: { todo: inMemory[idx] } })
+        if (inMemory[idx].completed) {
+          // find dependents in-memory
+          for (const other of inMemory) {
+            if (Array.isArray(other.dependencies) && other.dependencies.includes(inMemory[idx].id)) {
+              const locked = other.dependencies.some(dep => {
+                const t = inMemory.find(x => x.id === dep)
+                return !(t && t.completed)
+              })
+              if (!locked && other.locked) {
+                other.locked = false
+                broadcast({ type: 'sync:update', payload: { todo: other } })
+                broadcast({ type: 'todo:reminder', payload: { id: other.id, message: 'A dependency finished — this task is unlocked.' } })
+              }
+            }
+          }
+        }
       }
     }
     return
